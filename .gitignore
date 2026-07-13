@@ -1,0 +1,26 @@
+# Виртуальное окружение Python
+.venv/
+venv/
+env/
+
+# Кэш и артефакты сборки
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+
+# Результаты разбора (генерируются при запуске)
+output_local_llm/
+
+# Тестовые PDF и локальные черновики
+*.pdf
+_test_out.txt
+_test_*.py
+
+# IDE / ОС
+.idea/
+.vscode/
+*.swp
+Thumbs.db
+desktop.ini
