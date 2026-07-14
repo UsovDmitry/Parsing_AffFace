@@ -24,7 +24,8 @@ ROW_PIPE_START_RE = re.compile(
     r"^(?P<num>\d{1,2})(?:\.\s*\||\s*\|\s*(?!\d\s*\|))"
 )
 ROW_PLAIN_START_RE = re.compile(r"^(?P<num>\d{1,2})\.\s+(?=[А-ЯA-ZЁ«\"])")
-TABLE_COLUMN_HEADER_RE = re.compile(r"^\d+\s*\|\s*\d+\s*\|")
+# Нумерация колонок: «1 | 2 | …» и «1. | 2 | …» (pdfplumber часто ставит точку после № п/п).
+TABLE_COLUMN_HEADER_RE = re.compile(r"^\d{1,2}\.?\s*\|\s*\d+\s*\|")
 DATE_SHARE_TAIL_RE = re.compile(
     r"\|\s*(?P<date>\d{2}\.\d{2}\.\d{4}[^|]*)\s*\|\s*(?P<share_auth>[^|]*)\s*\|\s*(?P<share_ord>[^|]*)\s*$"
 )
@@ -47,6 +48,13 @@ BASIS_GARBAGE_RE = re.compile(
 INCOMPLETE_BASIS_END_RE = re.compile(
     r"(?:членом|органом|директором|группе)\s*\.?\s*$",
     re.IGNORECASE,
+)
+# Склейки оснований при кривом pipe/OCR (два статуса в одной фразе).
+BASIS_MALFORMED_RE = (
+    re.compile(r"членом\s+единоличным", re.IGNORECASE),
+    re.compile(r"является\s+членом\s+единоличным", re.IGNORECASE),
+    re.compile(r"членом\s+исполнительным", re.IGNORECASE),
+    re.compile(r"принадлежит\s+общество\s*$", re.IGNORECASE),
 )
 # Все даты «ДД.ММ.ГГГГ» в ячейке (порядок и повторы сохраняются).
 INN_COL3_RE = re.compile(r"\b\d{12}\b")
@@ -229,11 +237,42 @@ def _flatten_multiline_row(lines: list[str]) -> str:
 
 def _split_pipe_row_columns(flat_row: str) -> tuple[int | None, list[str]]:
     """Разбивает плоскую строку таблицы на номер п/п и ячейки колонок."""
-    match = re.match(r"^(?P<num>\d{1,2})(?:\.\s*)?\|\s*(?P<rest>.+)$", flat_row)
+    match = re.match(r"^(?P<num>\d{1,2})\s*\.?\s*\|\s*(?P<rest>.+)$", flat_row.strip())
     if not match:
         return None, []
     parts = [p.strip() for p in match.group("rest").split("|")]
     return int(match.group("num")), parts
+
+
+def _is_column_numbering_pipe_parts(pipe_parts: list[str]) -> bool:
+    """
+    Строка — нумерация колонок таблицы (2|3|4|5|6|7), а не запись аффилиата.
+
+    Срабатывает, если все непустые ячейки — целые числа, идущие подряд,
+    начиная с 1–3 (после колонки п/п в pipe остаются номера 2…7).
+    """
+    cells = [p.strip() for p in pipe_parts if p.strip()]
+    if len(cells) < 4:
+        return False
+    if not all(re.fullmatch(r"\d{1,2}", c) for c in cells):
+        return False
+    nums = [int(c) for c in cells]
+    if nums[0] > 3:
+        return False
+    return all(nums[i] + 1 == nums[i + 1] for i in range(len(nums) - 1))
+
+
+def is_table_column_numbering_row(
+    flat_row: str,
+    pipe_parts: list[str] | None = None,
+) -> bool:
+    """Строка pipe-таблицы — заголовок «№ | 1 | 2 | …», не данные аффилиата."""
+    stripped = (flat_row or "").strip()
+    if TABLE_COLUMN_HEADER_RE.match(stripped):
+        return True
+    if pipe_parts is None:
+        _, pipe_parts = _split_pipe_row_columns(stripped)
+    return _is_column_numbering_pipe_parts(pipe_parts)
 
 
 def _normalize_basis_ocr(text: str) -> str:
@@ -241,9 +280,70 @@ def _normalize_basis_ocr(text: str) -> str:
     return re.sub(r"\bЛифо\b", "Лицо", text or "", flags=re.IGNORECASE)
 
 
+def is_malformed_basis_phrase(phrase: str) -> bool:
+    """Битая склейка оснований (разрыв страницы / соседняя строка таблицы)."""
+    text = _flatten(_normalize_basis_ocr(phrase))
+    if not text:
+        return True
+    lower = text.lower()
+    for pat in BASIS_MALFORMED_RE:
+        if pat.search(lower):
+            return True
+    if "единоличным исполнительным" in lower and "совета директоров" in lower:
+        return True
+    if len(re.findall(r"лицо\s+является", lower)) > 1:
+        return True
+    return False
+
+
+def _basis_needs_council_continuation(last: str) -> bool:
+    """
+    True только если последнее основание обрывается на «…является членом»
+    и ждёт продолжения «Совета директоров Общества».
+    """
+    t = _flatten(_normalize_basis_ocr(last)).lower()
+    if "совета" in t or "директор" in t:
+        return False
+    if "единоличным" in t or "исполнительным органом" in t:
+        return False
+    if "принадлежит" in t and "группе" in t:
+        return False
+    return bool(re.search(r"(?:является\s+)?членом\s*\.?\s*$", t))
+
+
+def is_share_placeholder(value: Any) -> bool:
+    if value is None:
+        return True
+    text = str(value).strip()
+    if not text or text.lower() == "null":
+        return True
+    return bool(re.fullmatch(r"[-—–]+", text))
+
+
+def is_meaningful_share(value: Any) -> bool:
+    """Доля из таблицы: процент, «N акций», не пусто и не «—»."""
+    if is_share_placeholder(value):
+        return False
+    text = str(value).strip().lower()
+    if re.search(r"%|акци", text):
+        return True
+    cleaned = text.replace(",", ".")
+    if re.fullmatch(r"\d+(?:\.\d+)?", cleaned):
+        try:
+            return float(cleaned) > 7
+        except ValueError:
+            return False
+    return len(text) > 2
+
+
 def is_valid_basis_phrase(phrase: str) -> bool:
     text = _normalize_basis_ocr(_flatten(phrase))
     if len(text) < 12 or len(text) > 420:
+        return False
+    if is_malformed_basis_phrase(text):
+        return False
+    lower = text.lower()
+    if re.search(r"является\s+членом\s*\.?\s*$", lower) and "совета" not in lower:
         return False
     if BASIS_GARBAGE_RE.search(text):
         return False
@@ -280,39 +380,79 @@ def _is_date_only_cell(text: str) -> bool:
     return not without_dates
 
 
+def normalize_share_pct(value: Any) -> str | None:
+    """
+    Доля участия как строка: только числовая часть без округления.
+    «100%-1 акция» → «100», «95,999999» → «95.999999», «—» без изменений.
+    """
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text or text.lower() == "null":
+        return None
+    if re.fullmatch(r"[-—–]+", text):
+        return text
+    match = re.match(r"(\d+(?:[.,]\d+)?)", text)
+    if match:
+        return match.group(1).replace(",", ".")
+    return text
+
+
+def _unique_dates_ordered(dates: list[str]) -> list[str]:
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for d in dates:
+        key = str(d).strip()
+        if key and key not in seen:
+            seen.add(key)
+            ordered.append(key)
+    return ordered
+
+
 def align_basis_dates_to_bases(
     affiliation_basis: list[str],
     basis_dates: list[str],
 ) -> list[str]:
     """
-    Согласует массив дат с числом оснований аффилиации.
+    Даты «как в источнике»: без растягивания/дублирования под число оснований.
 
-    Правила:
-        • N оснований и N дат — возвращаем как есть;
-        • N оснований и 1 дата — одна дата относится ко всем основаниям;
-        • дат больше оснований — обрезаем лишние;
-        • дат меньше оснований (но больше одной) — дополняем последней датой;
-        • нет дат или нет оснований — [].
+    affiliation_basis не используется — оставлен для совместимости вызовов.
     """
-    bases_count = len(affiliation_basis)
-    if bases_count == 0:
-        return []
+    del affiliation_basis
+    return _unique_dates_ordered(
+        [str(d).strip() for d in basis_dates if d and str(d).strip()]
+    )
 
-    dates = [d.strip() for d in basis_dates if d and str(d).strip()]
-    if not dates:
-        return []
 
-    if len(dates) == 1:
-        return dates * bases_count
+def pick_basis_dates_for_row(
+    affiliation_basis: list[str],
+    *,
+    existing: list[str] | None = None,
+    table_dates: list[str] | None = None,
+    section_dates: list[str] | None = None,
+    step1_dates: list[str] | None = None,
+) -> list[str]:
+    """
+    Собирает уникальные даты по приоритету источников (step1 → table → JSON → section).
 
-    if len(dates) == bases_count:
-        return dates
-
-    if len(dates) > bases_count:
-        return dates[:bases_count]
-
-    last = dates[-1]
-    return dates + [last] * (bases_count - len(dates))
+    Без выравнивания под число оснований: даты берутся как есть.
+    """
+    del affiliation_basis
+    ordered_sources = [
+        list(step1_dates or []),
+        list(table_dates or []),
+        list(existing or []),
+        list(section_dates or []),
+    ]
+    merged: list[str] = []
+    seen: set[str] = set()
+    for dates in ordered_sources:
+        for d in dates:
+            key = str(d).strip()
+            if key and key not in seen:
+                seen.add(key)
+                merged.append(key)
+    return merged
 
 
 def _clean_basis_text_for_split(text: str) -> str:
@@ -341,6 +481,19 @@ def _clean_basis_text_for_split(text: str) -> str:
     return "\n".join(cleaned_lines)
 
 
+def _normalize_basis_fragment(phrase: str) -> str:
+    """Дополняет оборванный фрагмент основания типовым субъектом «Лицо»."""
+    p = _normalize_basis_ocr(_flatten(phrase)).strip().rstrip(";.").strip()
+    if not p:
+        return ""
+    lower = p.lower()
+    if lower.startswith(
+        ("принадлежит", "является", "имеет ", "осуществляет")
+    ) and not lower.startswith(("лицо", "общество", "юридическое")):
+        return f"Лицо {p}"
+    return p
+
+
 def split_basis_cell(text: str) -> list[str]:
     """Разбивает текст ячейки «основание» на отдельные формулировки."""
     flat = _normalize_basis_ocr(_flatten(_clean_basis_text_for_split(text)))
@@ -355,7 +508,8 @@ def split_basis_cell(text: str) -> list[str]:
     # Разделение по началу каждой типовой формулировки основания.
     parts = re.split(
         r"(?=(?:(?:Лицо|Общество|Юридическое\s+лицо,?)\s+"
-        r"(?:является|имеет|принадлежит|осуществляет)))",
+        r"(?:является|имеет|принадлежит|осуществляет)|"
+        r",?\s*является\s+членом))",
         flat,
         flags=re.IGNORECASE,
     )
@@ -368,12 +522,19 @@ def split_basis_cell(text: str) -> list[str]:
             part.strip(),
             flags=re.IGNORECASE,
         )
-        expanded.extend(subparts)
+        for sub in subparts:
+            expanded.extend(
+                re.split(
+                    r",\s*(?=(?:Лицо|Общество|принадлежит|является)\s)",
+                    sub.strip(),
+                    flags=re.IGNORECASE,
+                )
+            )
 
     phrases: list[str] = []
     seen: set[str] = set()
     for part in expanded:
-        phrase = part.strip().rstrip(";").strip()
+        phrase = _normalize_basis_fragment(part)
         phrase = re.sub(r";\s*Л\.?$", "", phrase).strip()
         if not is_valid_basis_phrase(phrase):
             continue
@@ -410,6 +571,9 @@ def _parse_row_lines(
 
     flat_row = _flatten_multiline_row(lines)
     _, pipe_parts = _split_pipe_row_columns(flat_row)
+
+    if is_table_column_numbering_row(flat_row, pipe_parts):
+        return None
 
     full_name = ""
     address = ""
@@ -544,11 +708,14 @@ def _iter_pipe_row_chunks(block: str) -> list[tuple[int, list[str]]]:
         if line.strip().startswith("---") or "===== ТАБЛИЦЫ" in line:
             flush()
             continue
-        if TABLE_COLUMN_HEADER_RE.match(line.strip()):
+        stripped = line.strip()
+        if TABLE_COLUMN_HEADER_RE.match(stripped) or is_table_column_numbering_row(
+            stripped
+        ):
             flush()
             continue
 
-        match = ROW_PIPE_START_RE.match(line.strip())
+        match = ROW_PIPE_START_RE.match(stripped)
         if match:
             flush()
             current_num = int(match.group("num"))
@@ -568,6 +735,10 @@ def _row_quality(record: dict[str, Any]) -> int:
     score = len(bases) * 100 + len(basis_text)
     if record.get("share_authorized_capital_pct"):
         score += 5
+    if is_meaningful_share(record.get("share_authorized_capital_pct")):
+        score += 12
+    if is_meaningful_share(record.get("share_ordinary_stocks_pct")):
+        score += 8
     basis_dates = record.get("basis_date") or []
     if basis_dates:
         score += 5 + len(basis_dates)
@@ -723,7 +894,7 @@ def _attach_orphan_basis_to_record(
     if not bases:
         return
     last = bases[-1]
-    if not INCOMPLETE_BASIS_END_RE.search(last):
+    if not _basis_needs_council_continuation(last):
         return
 
     window = _extract_between_rows(section_text, row_num, next_row)
@@ -733,7 +904,7 @@ def _attach_orphan_basis_to_record(
         cont = _flatten(match.group("basis"))
         if not cont or BASIS_GARBAGE_RE.search(cont):
             continue
-        if cont.lower().startswith(("совета", "исполнительным", "органом")):
+        if cont.lower().startswith("совета"):
             merged_last = _flatten(f"{last} {cont}")
             rebuilt = bases[:-1] + (split_basis_cell(merged_last) or [merged_last])
             record["affiliation_basis"] = [
@@ -741,15 +912,6 @@ def _attach_orphan_basis_to_record(
             ]
             attached = True
             break
-
-    if not attached:
-        plain = PLAIN_BASIS_CONT_RE.search(window)
-        if plain:
-            merged_last = _flatten(f"{last} Совета директоров Общества.")
-            rebuilt = bases[:-1] + (split_basis_cell(merged_last) or [merged_last])
-            record["affiliation_basis"] = [
-                p for p in rebuilt if is_valid_basis_phrase(p)
-            ]
 
 
 def _attach_orphan_basis_continuations(
@@ -765,7 +927,7 @@ def _attach_orphan_basis_continuations(
         if not bases:
             continue
         last = bases[-1]
-        if not INCOMPLETE_BASIS_END_RE.search(last):
+        if not _basis_needs_council_continuation(last):
             continue
 
         window = _extract_between_rows(section_text, row_num, row_num + 1)
@@ -775,7 +937,7 @@ def _attach_orphan_basis_continuations(
             cont = _flatten(match.group("basis"))
             if not cont or BASIS_GARBAGE_RE.search(cont):
                 continue
-            if cont.lower().startswith(("совета", "исполнительным", "органом")):
+            if cont.lower().startswith("совета"):
                 merged_last = _flatten(f"{last} {cont}")
                 rebuilt = bases[:-1] + (split_basis_cell(merged_last) or [merged_last])
                 record["affiliation_basis"] = [
@@ -783,15 +945,6 @@ def _attach_orphan_basis_continuations(
                 ]
                 attached = True
                 break
-
-        if not attached:
-            plain = PLAIN_BASIS_CONT_RE.search(window)
-            if plain:
-                merged_last = _flatten(f"{last} Совета директоров Общества.")
-                rebuilt = bases[:-1] + (split_basis_cell(merged_last) or [merged_last])
-                record["affiliation_basis"] = [
-                    p for p in rebuilt if is_valid_basis_phrase(p)
-                ]
 
 
 def _row_start_re(row_num: int) -> re.Pattern[str]:
@@ -928,20 +1081,116 @@ def match_record_by_name(
     return None
 
 
+def _lookup_pipe_record(
+    records: dict[int, dict[str, Any]],
+    row_number: int | None,
+    full_name: str,
+) -> dict[str, Any] | None:
+    if isinstance(row_number, int) and row_number in records:
+        return records[row_number]
+    return match_record_by_name(records, full_name)
+
+
+def parse_pipe_table_text(table_text: str | None) -> dict[int, dict[str, Any]]:
+    """
+    Разбор pipe-таблицы шага 1 LLM (N | full_name | col3 | basis | dates | shares).
+    Использует тот же chunk-парсер, что и section_text PDF.
+    """
+    if not (table_text or "").strip():
+        return {}
+
+    records: dict[int, dict[str, Any]] = {}
+    for row_num, lines in _iter_pipe_row_chunks(table_text):
+        flat = _flatten_multiline_row(lines)
+        _, pipe_parts = _split_pipe_row_columns(flat)
+        if is_table_column_numbering_row(flat, pipe_parts):
+            continue
+        parsed = _parse_row_lines(row_num, lines, column3_mode="address")
+        if not parsed:
+            continue
+        name = str(parsed.get("full_name") or "").strip()
+        if len(name) < 4:
+            continue
+        parsed["row_number_pdf"] = row_num
+        parsed.pop("_basis_text", None)
+        if row_num in records:
+            records[row_num] = _merge_record(records[row_num], parsed)
+        else:
+            records[row_num] = parsed
+    return records
+
+
+def _basis_list_quality(bases: list[str]) -> int:
+    if not bases:
+        return 0
+    score = len(bases) * 40
+    for phrase in bases:
+        if is_malformed_basis_phrase(phrase):
+            score -= 100
+        elif is_valid_basis_phrase(phrase):
+            score += 25
+    return score
+
+
+def choose_merged_table_record(
+    table_row: dict[str, Any] | None,
+    step1_row: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Лучший источник строки по полноте полей (PDF pipe vs step1 LLM)."""
+    if not table_row and not step1_row:
+        return None
+    if not table_row:
+        return dict(step1_row)
+    if not step1_row:
+        return dict(table_row)
+
+    def record_score(record: dict[str, Any]) -> int:
+        score = _row_quality(record) + _basis_list_quality(
+            record.get("affiliation_basis") or []
+        )
+        for share_key in ("share_authorized_capital_pct", "share_ordinary_stocks_pct"):
+            if is_meaningful_share(record.get(share_key)):
+                score += 12
+        return score
+
+    winner = (
+        table_row
+        if record_score(table_row) >= record_score(step1_row)
+        else step1_row
+    )
+    merged = dict(winner)
+    loser = table_row if winner is step1_row else step1_row
+
+    if not merged.get("affiliation_basis") and loser.get("affiliation_basis"):
+        merged["affiliation_basis"] = loser["affiliation_basis"]
+    if not merged.get("full_name") and loser.get("full_name"):
+        merged["full_name"] = loser["full_name"]
+    for share_key in ("share_authorized_capital_pct", "share_ordinary_stocks_pct"):
+        if is_share_placeholder(merged.get(share_key)) and is_meaningful_share(
+            loser.get(share_key)
+        ):
+            merged[share_key] = loser[share_key]
+    if merged.get("address") in (None, "", "-", "---") and loser.get("address"):
+        merged["address"] = loser.get("address")
+
+    return merged
+
+
 def apply_table_records_to_affiliates(
     affiliates: list[dict],
     section_text: str,
     full_text: str | None = None,
+    table_text: str | None = None,
 ) -> list[dict]:
     """
-    Подмешивает детерминированно разобранные поля таблицы в affiliates JSON.
-    Приоритет у табличного источника для basis / shares / row_number / колонка 3.
+    Подмешивает поля таблицы в affiliates JSON.
 
-  При column3_mode=address адрес берётся ТОЛЬКО из таблицы (как есть), без LLM/титула.
-  Совпадение адреса аффилиата с адресом эмитента сохраняется, если оно в ячейке таблицы.
+    Источник строки: лучший из детерминированного PDF pipe и pipe-таблицы шага 1 LLM.
+    При column3_mode=address адрес только из таблицы (как есть).
     """
     table_records = parse_affiliate_table_records(section_text)
-    if not table_records:
+    step1_records = parse_pipe_table_text(table_text)
+    if not table_records and not step1_records:
         return affiliates
 
     column3_mode = detect_column3_mode(section_text)
@@ -953,11 +1202,9 @@ def apply_table_records_to_affiliates(
 
         full_name = str(row.get("full_name") or "")
         row_number = row.get("row_number")
-        table_row = None
-        if isinstance(row_number, int) and row_number in table_records:
-            table_row = table_records[row_number]
-        if table_row is None:
-            table_row = match_record_by_name(table_records, full_name)
+        pdf_row = _lookup_pipe_record(table_records, row_number, full_name)
+        step1_row = _lookup_pipe_record(step1_records, row_number, full_name)
+        table_row = choose_merged_table_record(pdf_row, step1_row)
 
         if not table_row:
             row["affiliation_basis"] = _sanitize_basis_list(row.get("affiliation_basis") or [])
@@ -968,11 +1215,25 @@ def apply_table_records_to_affiliates(
             if column3_mode == "address":
                 row["address"] = None
                 row["_col3_from_table"] = False
+            row["_from_table"] = False
             continue
 
-        row["row_number"] = table_row.get("row_number_pdf") or table_row.get("row_number") or row.get("row_number")
+        row["row_number"] = (
+            table_row.get("row_number_pdf")
+            or table_row.get("row_number")
+            or row.get("row_number")
+        )
+        row["row_number_pdf"] = (
+            table_row.get("row_number_pdf")
+            or table_row.get("row_number")
+            or row.get("row_number_pdf")
+        )
 
-        table_bases = table_row.get("affiliation_basis") or []
+        table_bases = [
+            p
+            for p in (table_row.get("affiliation_basis") or [])
+            if is_valid_basis_phrase(p)
+        ]
         if table_bases:
             row["affiliation_basis"] = table_bases
         else:
@@ -996,17 +1257,27 @@ def apply_table_records_to_affiliates(
             row["_col3_from_table"] = bool(row.get("address"))
 
         final_bases = row.get("affiliation_basis") or []
-        table_dates = table_row.get("basis_date") or []
-        existing_dates = row.get("basis_date") or []
-        raw_dates = table_dates if len(table_dates) >= len(existing_dates) else existing_dates
-        if table_dates and len(table_dates) > len(raw_dates):
-            raw_dates = table_dates
+        row_num = row.get("row_number_pdf") or row.get("row_number")
+        section_dates: list[str] = []
+        if isinstance(row_num, int):
+            section_dates = extract_basis_dates_for_table_row(section_text, row_num)
+
+        raw_dates = pick_basis_dates_for_row(
+            final_bases,
+            existing=row.get("basis_date") or [],
+            table_dates=table_row.get("basis_date") or [],
+            section_dates=section_dates,
+            step1_dates=(step1_row or {}).get("basis_date") or [],
+        )
         row["basis_date"] = align_basis_dates_to_bases(final_bases, raw_dates)
 
         for share_key in ("share_authorized_capital_pct", "share_ordinary_stocks_pct"):
             table_share = table_row.get(share_key)
             if table_share is not None and str(table_share).strip():
-                row[share_key] = table_share
+                if is_meaningful_share(table_share) or is_share_placeholder(
+                    row.get(share_key)
+                ):
+                    row[share_key] = normalize_share_pct(table_share)
 
     if column3_mode == "address":
         # Только строки без табличного источника: срезаем подстановку LLM с титула.
@@ -1022,6 +1293,21 @@ def apply_table_records_to_affiliates(
                 row["address"] = None
 
     return affiliates
+
+
+def deduplicate_affiliates_by_pdf_row(affiliates: list[dict]) -> list[dict]:
+    """Оставляет одну запись на каждый row_number_pdf (лучшая по полноте полей)."""
+    by_pdf: dict[int, dict] = {}
+    for row in affiliates:
+        if not isinstance(row, dict):
+            continue
+        pdf = row.get("row_number_pdf") or row.get("row_number")
+        if not isinstance(pdf, int):
+            continue
+        prev = by_pdf.get(pdf)
+        if prev is None or _row_quality(row) > _row_quality(prev):
+            by_pdf[pdf] = row
+    return [by_pdf[k] for k in sorted(by_pdf)]
 
 
 def _sanitize_basis_list(basis_list: list[Any]) -> list[str]:
